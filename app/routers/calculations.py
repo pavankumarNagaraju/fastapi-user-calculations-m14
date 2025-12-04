@@ -1,3 +1,5 @@
+# app/routers/calculations.py
+
 from datetime import datetime
 from typing import List
 
@@ -6,61 +8,79 @@ from sqlalchemy.orm import Session
 
 from app import models, schemas
 from app.database import get_db
+from app.dependencies import get_current_user
 
-router = APIRouter()
+router = APIRouter(
+    prefix="/calculations",
+    tags=["calculations"],
+)
 
 
-def _compute_result(operand1: float, operand2: float, operation: str) -> float:
-    if operation == "add":
+def perform_operation(operation: str, operand1: float, operand2: float) -> float:
+    """
+    Simple arithmetic engine for the calculator.
+    Supports: add, subtract, multiply, divide.
+    """
+    op = operation.lower()
+    if op == "add":
         return operand1 + operand2
-    if operation == "subtract":
+    elif op == "subtract":
         return operand1 - operand2
-    if operation == "multiply":
+    elif op == "multiply":
         return operand1 * operand2
-    if operation == "divide":
+    elif op == "divide":
         if operand2 == 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Cannot divide by zero",
             )
         return operand1 / operand2
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported operation '{operation}'",
+        )
 
-    # This is what test_invalid_operation_returns_error expects (400)
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail="Invalid operation",
+
+@router.get("/", response_model=List[schemas.CalculationRead])
+def browse_calculations(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Browse: return all calculations for the current user.
+    """
+    calculations = (
+        db.query(models.Calculation)
+        .filter(models.Calculation.user_id == current_user.id)
+        .order_by(models.Calculation.id)
+        .all()
     )
+    return calculations
 
 
 @router.post(
-    "/",
-    response_model=schemas.CalculationRead,
-    status_code=status.HTTP_201_CREATED,
+    "/", response_model=schemas.CalculationRead, status_code=status.HTTP_200_OK
 )
-def create_calculation(
+def add_calculation(
     calc_in: schemas.CalculationCreate,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
 ):
     """
-    POST /calculations
-
-    Used by test_calculation_bread_flow:
-    - Creates a calculation
-    - Stores result in DB
-    - Returns 201 + CalculationRead
+    Add: create a new calculation for the current user.
     """
-    result = _compute_result(
-        calc_in.operand1,
-        calc_in.operand2,
-        calc_in.operation,
+    result = perform_operation(
+        calc_in.operation, calc_in.operand1, calc_in.operand2
     )
 
     calc = models.Calculation(
+        user_id=current_user.id,
+        operation=calc_in.operation,
         operand1=calc_in.operand1,
         operand2=calc_in.operand2,
-        operation=calc_in.operation,
         result=result,
-        created_at=datetime.utcnow(),
+        created_at=datetime.utcnow(),  # deprecation warning is fine for now
     )
     db.add(calc)
     db.commit()
@@ -68,60 +88,48 @@ def create_calculation(
     return calc
 
 
-@router.get(
-    "/",
-    response_model=List[schemas.CalculationRead],
-)
-def list_calculations(db: Session = Depends(get_db)):
+@router.get("/{calc_id}", response_model=schemas.CalculationRead)
+def read_calculation(
+    calc_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
     """
-    GET /calculations
-    Returns all calculations.
-    """
-    return db.query(models.Calculation).all()
-
-
-@router.get(
-    "/{calc_id}",
-    response_model=schemas.CalculationRead,
-)
-def get_calculation(calc_id: int, db: Session = Depends(get_db)):
-    """
-    GET /calculations/{id}
+    Read: get a single calculation by ID for the current user.
     """
     calc = db.query(models.Calculation).get(calc_id)
-    if not calc:
-        raise HTTPException(status_code=404, detail="Calculation not found")
+    if not calc or calc.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Calculation not found",
+        )
     return calc
 
 
-@router.put(
-    "/{calc_id}",
-    response_model=schemas.CalculationRead,
-)
-def update_calculation(
+@router.put("/{calc_id}", response_model=schemas.CalculationRead)
+@router.patch("/{calc_id}", response_model=schemas.CalculationRead)
+def edit_calculation(
     calc_id: int,
-    calc_in: schemas.CalculationUpdate,
+    calc_in: schemas.CalculationCreate,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
 ):
     """
-    PUT /calculations/{id}
-    Updates operands/operation and recomputes result.
+    Edit: update an existing calculation and persist new result.
+    Accepts same fields as CalculationCreate.
     """
     calc = db.query(models.Calculation).get(calc_id)
-    if not calc:
-        raise HTTPException(status_code=404, detail="Calculation not found")
+    if not calc or calc.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Calculation not found",
+        )
 
-    if calc_in.operand1 is not None:
-        calc.operand1 = calc_in.operand1
-    if calc_in.operand2 is not None:
-        calc.operand2 = calc_in.operand2
-    if calc_in.operation is not None:
-        calc.operation = calc_in.operation
-
-    calc.result = _compute_result(
-        calc.operand1,
-        calc.operand2,
-        calc.operation,
+    calc.operation = calc_in.operation
+    calc.operand1 = calc_in.operand1
+    calc.operand2 = calc_in.operand2
+    calc.result = perform_operation(
+        calc_in.operation, calc_in.operand1, calc_in.operand2
     )
 
     db.commit()
@@ -129,16 +137,24 @@ def update_calculation(
     return calc
 
 
-@router.delete("/{calc_id}")
-def delete_calculation(calc_id: int, db: Session = Depends(get_db)):
+@router.delete("/{calc_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_calculation(
+    calc_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
     """
-    DELETE /calculations/{id}
-    Returns 200 + simple detail message.
+    Delete: remove a calculation by ID for the current user.
+    Returns HTTP 204 No Content on success (what your test expects).
     """
     calc = db.query(models.Calculation).get(calc_id)
-    if not calc:
-        raise HTTPException(status_code=404, detail="Calculation not found")
+    if not calc or calc.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Calculation not found",
+        )
 
     db.delete(calc)
     db.commit()
-    return {"detail": "Calculation deleted"}
+    # 204 No Content → return nothing
+    return None
